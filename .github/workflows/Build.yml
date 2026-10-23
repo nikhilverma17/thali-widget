@@ -1,5 +1,5 @@
 name: Build APK
-# This one file contains the whole Thali Widget Android app (v3.1: bigger, size-aware widgets).
+# This one file contains the whole Thali Widget Android app (v4.0: full Thali app + widgets).
 # It creates the project on GitHub's machine and builds the APK,
 # so nothing else needs to be uploaded to the repository.
 
@@ -41,8 +41,8 @@ jobs:
                   applicationId = "com.thali.widget"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "3.1"
+                  versionCode = 5
+                  versionName = "4.0"
               }
 
               buildTypes {
@@ -76,14 +76,24 @@ jobs:
                   android:allowBackup="true">
 
                   <activity
-                      android:name=".MainActivity"
+                      android:name=".AppActivity"
                       android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
                       android:windowSoftInputMode="adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
+                      <meta-data
+                          android:name="android.app.shortcuts"
+                          android:resource="@xml/shortcuts" />
                   </activity>
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:label="@string/settings_label"
+                      android:windowSoftInputMode="adjustResize" />
 
                   <receiver
                       android:name=".ThaliWidget"
@@ -112,6 +122,122 @@ jobs:
           THALI_EOF
 
           mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/AppActivity.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.View
+          import android.webkit.CookieManager
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceError
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.ProgressBar
+
+          /** The full Thali tracker, opened inside the app (no browser bar). */
+          class AppActivity : Activity() {
+
+              private var web: WebView? = null
+              private lateinit var bar: ProgressBar
+              private lateinit var offline: View
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val url = ThaliData.appUrl(this)
+                  if (!url.startsWith("http")) {
+                      // No link yet: go to the setup screen first
+                      startActivity(Intent(this, MainActivity::class.java))
+                      finish()
+                      return
+                  }
+                  setContentView(R.layout.activity_app)
+                  val w = findViewById<WebView>(R.id.web)
+                  web = w
+                  bar = findViewById(R.id.load_bar)
+                  offline = findViewById(R.id.offline)
+
+                  findViewById<Button>(R.id.retry).setOnClickListener {
+                      offline.visibility = View.GONE
+                      w.reload()
+                  }
+                  findViewById<Button>(R.id.settings).setOnClickListener {
+                      startActivity(Intent(this, MainActivity::class.java))
+                  }
+
+                  w.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true        // keeps you signed in (the app stores its login token)
+                      databaseEnabled = true
+                      loadWithOverviewMode = true
+                      useWideViewPort = true
+                      setSupportZoom(false)
+                  }
+                  CookieManager.getInstance().setAcceptCookie(true)
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+
+                  w.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                          val host = request.url.host ?: return false
+                          val google = host.endsWith("google.com") || host.endsWith("googleusercontent.com") ||
+                              host.endsWith("gstatic.com") || host.endsWith("googleapis.com")
+                          if (google) return false
+                          startActivity(Intent(Intent.ACTION_VIEW, request.url))   // other links open in the browser
+                          return true
+                      }
+
+                      override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                          if (request.isForMainFrame) offline.visibility = View.VISIBLE
+                      }
+                  }
+                  w.webChromeClient = object : WebChromeClient() {
+                      override fun onProgressChanged(view: WebView, newProgress: Int) {
+                          bar.progress = newProgress
+                          bar.visibility = if (newProgress < 100) View.VISIBLE else View.GONE
+                      }
+                  }
+                  w.setDownloadListener { dlUrl, _, _, _, _ ->
+                      if (dlUrl.startsWith("http")) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(dlUrl)))
+                  }
+
+                  if (savedInstanceState != null) w.restoreState(savedInstanceState) else w.loadUrl(url)
+              }
+
+              override fun onSaveInstanceState(outState: Bundle) {
+                  super.onSaveInstanceState(outState)
+                  web?.saveState(outState)
+              }
+
+              @Deprecated("Uses the platform back behaviour on all Android versions")
+              override fun onBackPressed() {
+                  val w = web
+                  if (w != null && w.canGoBack()) w.goBack() else super.onBackPressed()
+              }
+
+              /** Leaving the app: refresh the widget so newly logged food and water show up. */
+              override fun onPause() {
+                  super.onPause()
+                  if (ThaliData.link(this).contains("widget=")) {
+                      ThaliWidget.updateAll(this, updating = true)
+                      RefreshWorker.runNow(this)
+                  }
+              }
+
+              override fun onDestroy() {
+                  web?.destroy()
+                  web = null
+                  super.onDestroy()
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
           cat > app/src/main/java/com/thali/widget/MainActivity.kt <<'THALI_EOF'
           package com.thali.widget
 
@@ -119,7 +245,6 @@ jobs:
           import android.content.ClipboardManager
           import android.content.Context
           import android.content.Intent
-          import android.net.Uri
           import android.os.Bundle
           import android.widget.Button
           import android.widget.EditText
@@ -149,27 +274,32 @@ jobs:
                   findViewById<Button>(R.id.save).setOnClickListener { saveAndTest() }
 
                   findViewById<Button>(R.id.open_app).setOnClickListener {
-                      val url = ThaliData.appUrl(this)
-                      if (url.startsWith("http")) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                      else result.text = getString(R.string.need_link)
+                      if (ThaliData.appUrl(this).startsWith("http")) {
+                          startActivity(Intent(this, AppActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP))
+                          finish()
+                      } else result.text = getString(R.string.need_link)
                   }
                   showCached()
               }
 
               private fun saveAndTest() {
                   val link = input.text.toString().trim()
-                  if (!link.startsWith("https://script.google.com/") || !link.contains("widget=")) {
+                  if (!link.startsWith("https://script.google.com/") || !link.contains("/exec")) {
                       result.text = getString(R.string.bad_link)
                       return
                   }
                   ThaliData.saveLink(this, link)
                   result.text = getString(R.string.testing)
                   thread {
-                      val err = ThaliData.refresh(this)
+                      val err = if (link.contains("widget=")) ThaliData.refresh(this) else null
                       ThaliWidget.updateAll(this)
                       RefreshWorker.schedule(this)
                       runOnUiThread {
-                          if (err != null) result.text = "Didn’t work: $err" else showCached(prefix = "Saved. ")
+                          when {
+                              err != null -> result.text = "Didn’t work: $err"
+                              !link.contains("widget=") -> result.text = "Saved. Tap Open Thali. (For the widgets, use the widget link from the Me tab.)"
+                              else -> showCached(prefix = "Saved. ")
+                          }
                       }
                   }
               }
@@ -287,7 +417,7 @@ jobs:
                   val link = link(ctx)
                   if (link.isBlank()) return "No link saved yet"
                   return try {
-                      val body = httpGet("$link&s=${seed(ctx)}")
+                      val body = httpGet(withParam(link, "s=${seed(ctx)}"))
                       val json = try {
                           JSONObject(body)
                       } catch (e: Exception) {
@@ -316,7 +446,7 @@ jobs:
                   val link = link(ctx)
                   if (link.isBlank()) return "No link saved yet"
                   return try {
-                      val json = JSONObject(httpGet("$link&addWater=$ml&s=${seed(ctx)}"))
+                      val json = JSONObject(httpGet(withParam(link, "addWater=$ml&s=${seed(ctx)}")))
                       if (json.has("error")) throw IllegalStateException(json.optString("error"))
                       prefs(ctx).edit().putString(KEY_JSON, json.toString())
                           .putLong(KEY_FETCHED, System.currentTimeMillis()).remove(KEY_ERROR).apply()
@@ -337,6 +467,8 @@ jobs:
                   d.put("waterPercent", water * 100 / goal)
                   prefs(ctx).edit().putString(KEY_JSON, d.toString()).apply()
               }
+
+              private fun withParam(link: String, p: String) = if (link.contains("?")) "$link&$p" else "$link?$p"
 
               private fun httpGet(start: String): String {
                   var url = start
@@ -397,7 +529,6 @@ jobs:
           import android.content.ComponentName
           import android.content.Context
           import android.content.Intent
-          import android.net.Uri
           import android.os.Bundle
           import android.text.format.DateFormat
           import android.view.View
@@ -492,9 +623,7 @@ jobs:
                       v.setOnClickPendingIntent(R.id.add_water, PendingIntent.getBroadcast(ctx, 3, water, flags))
 
                       // Tapping the widget or "+ Food" opens the tracker (or this app if no link yet)
-                      val appUrl = ThaliData.appUrl(ctx)
-                      val open = if (appUrl.startsWith("http")) Intent(Intent.ACTION_VIEW, Uri.parse(appUrl))
-                                 else Intent(ctx, MainActivity::class.java)
+                      val open = Intent(ctx, AppActivity::class.java)
                       open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                       val openPi = PendingIntent.getActivity(ctx, 2, open, flags)
                       v.setOnClickPendingIntent(R.id.root, openPi)
@@ -755,6 +884,87 @@ jobs:
               <solid android:color="@color/bg" />
               <corners android:radius="26dp" />
           </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_app.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@color/screen"
+              android:fitsSystemWindows="true">
+
+              <WebView
+                  android:id="@+id/web"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent" />
+
+              <ProgressBar
+                  android:id="@+id/load_bar"
+                  style="@android:style/Widget.ProgressBar.Horizontal"
+                  android:layout_width="match_parent"
+                  android:layout_height="3dp"
+                  android:indeterminate="false"
+                  android:max="100"
+                  android:progressTint="@color/turmeric"
+                  android:progressBackgroundTint="@android:color/transparent" />
+
+              <LinearLayout
+                  android:id="@+id/offline"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:background="@color/screen"
+                  android:gravity="center"
+                  android:orientation="vertical"
+                  android:padding="32dp"
+                  android:visibility="gone">
+
+                  <ImageView
+                      android:layout_width="80dp"
+                      android:layout_height="80dp"
+                      android:contentDescription="@null"
+                      android:src="@drawable/ic_foreground" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:text="@string/offline_title"
+                      android:textColor="@color/ink"
+                      android:textSize="22sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:gravity="center"
+                      android:text="@string/offline_body"
+                      android:textColor="@color/muted"
+                      android:textSize="15sp" />
+
+                  <Button
+                      android:id="@+id/retry"
+                      android:layout_width="200dp"
+                      android:layout_height="52dp"
+                      android:layout_marginTop="24dp"
+                      android:background="@drawable/btn_bg"
+                      android:text="@string/retry"
+                      android:textAllCaps="false"
+                      android:textColor="#FFFFFFFF" />
+
+                  <Button
+                      android:id="@+id/settings"
+                      android:layout_width="200dp"
+                      android:layout_height="52dp"
+                      android:layout_marginTop="12dp"
+                      android:background="@drawable/btn_soft"
+                      android:text="@string/link_settings"
+                      android:textAllCaps="false"
+                      android:textColor="@color/ink" />
+              </LinearLayout>
+          </FrameLayout>
           THALI_EOF
 
           mkdir -p app/src/main/res/layout
@@ -2246,20 +2456,20 @@ jobs:
           mkdir -p app/src/main/res/values
           cat > app/src/main/res/values/strings.xml <<'THALI_EOF'
           <resources>
-              <string name="app_name">Thali Widget</string>
+              <string name="app_name">Thali</string>
               <string name="widget_name">Thali</string>
               <string name="widget_desc">Today’s calories, protein and water from your Thali tracker</string>
               <string name="widget_setup">Open the Thali Widget app and paste your link</string>
               <string name="widget_loading">Loading…</string>
               <string name="updating">Updating…</string>
-              <string name="intro">Paste the widget link from Thali (Me tab → Show my widget link → Copy the data link). Then add the Thali widget to your home screen.</string>
+              <string name="intro">Paste your Thali link. Use the widget link from the Me tab (Show my widget link → Copy the data link) so the app and the home screen widgets both work. The plain app link ending in /exec also works, but then the widgets can’t show your numbers.</string>
               <string name="link_hint">https://script.google.com/macros/s/…/exec?widget=…</string>
               <string name="paste">Paste</string>
               <string name="save">Save and test</string>
-              <string name="open_app">Open Thali tracker</string>
+              <string name="open_app">Open Thali</string>
               <string name="testing">Checking your link…</string>
               <string name="clipboard_empty">Nothing copied yet. Copy the data link from Thali first.</string>
-              <string name="bad_link">That doesn’t look like a Thali widget link. It should start with https://script.google.com/ and contain widget=</string>
+              <string name="bad_link">That doesn’t look like a Thali link. It should start with https://script.google.com/ and contain /exec</string>
               <string name="need_link">Save your link first.</string>
               <string name="add_widget_hint">Now go to your home screen, long-press an empty spot, tap Widgets, and find Thali Widget. There are two: Thali (rings) and Thali + suggestion (rings plus what to eat next).</string>
               <string name="refresh">Refresh</string>
@@ -2268,6 +2478,11 @@ jobs:
               <string name="widget_suggest_name">Thali + suggestion</string>
               <string name="widget_suggest_desc">Calories, protein and water, plus what to eat next</string>
               <string name="another">Another suggestion</string>
+              <string name="offline_title">Can’t reach Thali</string>
+              <string name="offline_body">Check your internet connection and try again. If it keeps happening, check your link in Link settings.</string>
+              <string name="retry">Try again</string>
+              <string name="link_settings">Link settings</string>
+              <string name="settings_label">Thali link settings</string>
           </resources>
           THALI_EOF
 
@@ -2281,6 +2496,23 @@ jobs:
                   <item name="android:statusBarColor">@color/screen</item>
               </style>
           </resources>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/shortcuts.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+              <shortcut
+                  android:enabled="true"
+                  android:icon="@drawable/ic_foreground"
+                  android:shortcutId="link_settings"
+                  android:shortcutShortLabel="@string/link_settings">
+                  <intent
+                      android:action="android.intent.action.VIEW"
+                      android:targetClass="com.thali.widget.MainActivity"
+                      android:targetPackage="com.thali.widget" />
+              </shortcut>
+          </shortcuts>
           THALI_EOF
 
           mkdir -p app/src/main/res/xml
