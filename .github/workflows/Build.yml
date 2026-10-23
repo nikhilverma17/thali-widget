@@ -1,0 +1,2379 @@
+name: Build APK
+# This one file contains the whole Thali Widget Android app (v3.1: bigger, size-aware widgets).
+# It creates the project on GitHub's machine and builds the APK,
+# so nothing else needs to be uploaded to the repository.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Create Android project
+        shell: bash
+        run: |
+          mkdir -p project && cd project
+          mkdir -p app
+          cat > app/build.gradle.kts <<'THALI_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.thali.widget"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.thali.widget"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 4
+                  versionName = "3.1"
+              }
+
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.work:work-runtime-ktx:2.9.1")
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:theme="@style/AppTheme"
+                  android:allowBackup="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".ThaliWidget"
+                      android:exported="true"
+                      android:label="@string/widget_name">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/thali_widget_info" />
+                  </receiver>
+                  <receiver
+                      android:name=".ThaliSuggestWidget"
+                      android:exported="true"
+                      android:label="@string/widget_suggest_name">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/thali_widget_suggest_info" />
+                  </receiver>
+              </application>
+          </manifest>
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/MainActivity.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.app.Activity
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.TextView
+          import kotlin.concurrent.thread
+
+          /** One screen: paste your widget link, test it, save it. */
+          class MainActivity : Activity() {
+
+              private lateinit var input: EditText
+              private lateinit var result: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  input = findViewById(R.id.link_input)
+                  result = findViewById(R.id.result)
+                  input.setText(ThaliData.link(this))
+
+                  findViewById<Button>(R.id.paste).setOnClickListener {
+                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      val text = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+                      if (text.isNullOrBlank()) result.text = getString(R.string.clipboard_empty) else input.setText(text.trim())
+                  }
+
+                  findViewById<Button>(R.id.save).setOnClickListener { saveAndTest() }
+
+                  findViewById<Button>(R.id.open_app).setOnClickListener {
+                      val url = ThaliData.appUrl(this)
+                      if (url.startsWith("http")) startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                      else result.text = getString(R.string.need_link)
+                  }
+                  showCached()
+              }
+
+              private fun saveAndTest() {
+                  val link = input.text.toString().trim()
+                  if (!link.startsWith("https://script.google.com/") || !link.contains("widget=")) {
+                      result.text = getString(R.string.bad_link)
+                      return
+                  }
+                  ThaliData.saveLink(this, link)
+                  result.text = getString(R.string.testing)
+                  thread {
+                      val err = ThaliData.refresh(this)
+                      ThaliWidget.updateAll(this)
+                      RefreshWorker.schedule(this)
+                      runOnUiThread {
+                          if (err != null) result.text = "Didn’t work: $err" else showCached(prefix = "Saved. ")
+                      }
+                  }
+              }
+
+              private fun showCached(prefix: String = "") {
+                  val d = ThaliData.cached(this) ?: return
+                  result.text = prefix + "Hi ${d.optString("name")}! Today: ${ThaliData.fmt(d.optInt("total"))} of " +
+                      "${ThaliData.fmt(d.optInt("goal"))} kcal, water ${ThaliData.fmt(d.optInt("water"))} ml.\n\n" +
+                      getString(R.string.add_widget_hint)
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/RefreshWorker.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.content.Context
+          import androidx.work.*
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.util.concurrent.TimeUnit
+
+          /** Fetches fresh numbers (or adds water) in the background and redraws every Thali widget. */
+          class RefreshWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+              override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+                  val ml = inputData.getInt(KEY_WATER, 0)
+                  if (ml > 0) ThaliData.addWater(applicationContext, ml) else ThaliData.refresh(applicationContext)
+                  ThaliWidget.updateAll(applicationContext)
+                  Result.success()
+              }
+
+              companion object {
+                  private const val PERIODIC = "thali-periodic"
+                  private const val NOW = "thali-now"
+                  private const val WATER = "thali-water"
+                  private const val KEY_WATER = "addWater"
+
+                  private val online = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+
+                  /** Every 15 minutes (the shortest interval Android allows). */
+                  fun schedule(ctx: Context) {
+                      val req = PeriodicWorkRequestBuilder<RefreshWorker>(15, TimeUnit.MINUTES)
+                          .setConstraints(online)
+                          .build()
+                      WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.KEEP, req)
+                  }
+
+                  fun runNow(ctx: Context) {
+                      val req = OneTimeWorkRequestBuilder<RefreshWorker>().setConstraints(online).build()
+                      WorkManager.getInstance(ctx).enqueueUniqueWork(NOW, ExistingWorkPolicy.REPLACE, req)
+                  }
+
+                  /** Water taps queue up one after another so none are lost. */
+                  fun addWater(ctx: Context, ml: Int) {
+                      val req = OneTimeWorkRequestBuilder<RefreshWorker>()
+                          .setConstraints(online)
+                          .setInputData(workDataOf(KEY_WATER to ml))
+                          .build()
+                      WorkManager.getInstance(ctx).enqueueUniqueWork(WATER, ExistingWorkPolicy.APPEND_OR_REPLACE, req)
+                  }
+
+                  fun cancel(ctx: Context) {
+                      WorkManager.getInstance(ctx).cancelUniqueWork(PERIODIC)
+                  }
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/ThaliData.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.content.Context
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.text.NumberFormat
+          import java.util.Locale
+
+          /** Saved link + last fetched numbers, kept in SharedPreferences. */
+          object ThaliData {
+              private const val PREFS = "thali"
+              private const val KEY_LINK = "link"
+              private const val KEY_JSON = "json"
+              private const val KEY_ERROR = "error"
+              private const val KEY_FETCHED = "fetched"
+
+              private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              fun link(ctx: Context): String = prefs(ctx).getString(KEY_LINK, "") ?: ""
+
+              fun saveLink(ctx: Context, link: String) {
+                  prefs(ctx).edit().putString(KEY_LINK, link.trim()).remove(KEY_JSON).remove(KEY_ERROR).apply()
+              }
+
+              /** The tracker's own address: the widget link without "?widget=…". */
+              fun appUrl(ctx: Context): String = link(ctx).substringBefore("?")
+
+              fun cached(ctx: Context): JSONObject? =
+                  prefs(ctx).getString(KEY_JSON, null)?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+              fun lastError(ctx: Context): String? = prefs(ctx).getString(KEY_ERROR, null)
+
+              fun fetchedAt(ctx: Context): Long = prefs(ctx).getLong(KEY_FETCHED, 0L)
+
+              private const val KEY_SEED = "seed"
+
+              /** Which suggestion to show; "Another" moves it on. */
+              fun seed(ctx: Context): Int = prefs(ctx).getInt(KEY_SEED, 0)
+              fun nextSeed(ctx: Context) { prefs(ctx).edit().putInt(KEY_SEED, seed(ctx) + 1).apply() }
+
+              /** Downloads the latest numbers. Returns null on success or an error message. Call off the main thread. */
+              fun refresh(ctx: Context): String? {
+                  val link = link(ctx)
+                  if (link.isBlank()) return "No link saved yet"
+                  return try {
+                      val body = httpGet("$link&s=${seed(ctx)}")
+                      val json = try {
+                          JSONObject(body)
+                      } catch (e: Exception) {
+                          throw IllegalStateException(
+                              if (body.contains("accounts.google.com") || body.contains("<html", true))
+                                  "The link opened a Google page instead of your numbers. Redeploy the web app with access set to Anyone."
+                              else "The link didn’t return Thali data. Copy it again from the Me tab."
+                          )
+                      }
+                      if (json.has("error")) throw IllegalStateException("Link not valid: make a new one on the Me tab.")
+                      prefs(ctx).edit()
+                          .putString(KEY_JSON, json.toString())
+                          .putLong(KEY_FETCHED, System.currentTimeMillis())
+                          .remove(KEY_ERROR)
+                          .apply()
+                      null
+                  } catch (e: Exception) {
+                      val msg = e.message ?: "Couldn’t reach Thali. Check your internet."
+                      prefs(ctx).edit().putString(KEY_ERROR, msg).apply()
+                      msg
+                  }
+              }
+
+              /** Adds water for today through the widget link, then saves the new numbers. Call off the main thread. */
+              fun addWater(ctx: Context, ml: Int): String? {
+                  val link = link(ctx)
+                  if (link.isBlank()) return "No link saved yet"
+                  return try {
+                      val json = JSONObject(httpGet("$link&addWater=$ml&s=${seed(ctx)}"))
+                      if (json.has("error")) throw IllegalStateException(json.optString("error"))
+                      prefs(ctx).edit().putString(KEY_JSON, json.toString())
+                          .putLong(KEY_FETCHED, System.currentTimeMillis()).remove(KEY_ERROR).apply()
+                      null
+                  } catch (e: Exception) {
+                      val msg = e.message ?: "Couldn’t add water. Check your internet."
+                      prefs(ctx).edit().putString(KEY_ERROR, msg).apply()
+                      msg
+                  }
+              }
+
+              /** Shows added water on the widget straight away, before the server confirms it. */
+              fun bumpWater(ctx: Context, ml: Int) {
+                  val d = cached(ctx) ?: return
+                  val water = d.optInt("water") + ml
+                  val goal = d.optInt("waterGoal", 2500).coerceAtLeast(1)
+                  d.put("water", water)
+                  d.put("waterPercent", water * 100 / goal)
+                  prefs(ctx).edit().putString(KEY_JSON, d.toString()).apply()
+              }
+
+              private fun httpGet(start: String): String {
+                  var url = start
+                  repeat(6) {
+                      val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                          instanceFollowRedirects = false
+                          connectTimeout = 20000
+                          readTimeout = 20000
+                          setRequestProperty("User-Agent", "ThaliWidget/1.0 (Android)")
+                      }
+                      try {
+                          val code = conn.responseCode
+                          if (code in 300..399) {
+                              val next = conn.getHeaderField("Location") ?: throw IllegalStateException("Redirect without a target")
+                              url = URL(URL(url), next).toString()
+                              return@repeat
+                          }
+                          if (code !in 200..299) throw IllegalStateException("Server answered $code. Check the link.")
+                          return conn.inputStream.bufferedReader().use { it.readText() }
+                      } finally {
+                          conn.disconnect()
+                      }
+                  }
+                  throw IllegalStateException("Too many redirects")
+              }
+
+              private val nf: NumberFormat = NumberFormat.getIntegerInstance(Locale("en", "IN"))
+              fun fmt(n: Int): String = nf.format(n)
+
+              /** 34.0 -> "34", 34.5 -> "34.5" */
+              fun fmt1(n: Double): String = if (n % 1.0 == 0.0) nf.format(n.toLong()) else String.format(Locale.US, "%.1f", n)
+
+              /** 1500 -> "1.5 L", 750 -> "0.75 L" */
+              fun litres(ml: Int): String {
+                  val l = ml / 1000.0
+                  return (if (ml % 100 == 0) String.format(Locale.US, "%.1f", l) else String.format(Locale.US, "%.2f", l)) + " L"
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/ThaliSuggestWidget.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          /** The taller widget: the same three rings plus a meal suggestion. */
+          class ThaliSuggestWidget : ThaliWidget() {
+              override val suggest: Boolean get() = true
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/ThaliWidget.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.text.format.DateFormat
+          import android.view.View
+          import android.widget.RemoteViews
+          import java.util.Date
+
+          open class ThaliWidget : AppWidgetProvider() {
+
+              /** true for the taller widget that also shows a meal suggestion */
+              open val suggest: Boolean get() = false
+
+              override fun onUpdate(ctx: Context, mgr: AppWidgetManager, ids: IntArray) {
+                  ids.forEach { mgr.updateAppWidget(it, build(ctx, layoutFor(mgr, it, suggest))) }
+                  RefreshWorker.schedule(ctx)
+                  RefreshWorker.runNow(ctx)
+              }
+
+              /** Redraw with the right layout when the widget is resized. */
+              override fun onAppWidgetOptionsChanged(ctx: Context, mgr: AppWidgetManager, id: Int, newOptions: Bundle) {
+                  mgr.updateAppWidget(id, build(ctx, layoutFor(mgr, id, suggest)))
+              }
+
+              override fun onEnabled(ctx: Context) {
+                  RefreshWorker.schedule(ctx)
+                  RefreshWorker.runNow(ctx)
+              }
+
+              override fun onDisabled(ctx: Context) {
+                  RefreshWorker.cancel(ctx)
+              }
+
+              override fun onReceive(ctx: Context, intent: Intent) {
+                  super.onReceive(ctx, intent)
+                  when (intent.action) {
+                      ACTION_REFRESH -> {
+                          updateAll(ctx, updating = true)
+                          RefreshWorker.runNow(ctx)
+                      }
+                      ACTION_SHUFFLE -> {
+                          ThaliData.nextSeed(ctx)
+                          updateAll(ctx, updating = true)
+                          RefreshWorker.runNow(ctx)
+                      }
+                      ACTION_WATER -> {
+                          if (ThaliData.link(ctx).isBlank()) return
+                          ThaliData.bumpWater(ctx, GLASS_ML)
+                          updateAll(ctx, updating = true)
+                          RefreshWorker.addWater(ctx, GLASS_ML)
+                      }
+                  }
+              }
+
+              companion object {
+                  const val ACTION_REFRESH = "com.thali.widget.REFRESH"
+                  const val ACTION_WATER = "com.thali.widget.ADD_WATER"
+                  const val ACTION_SHUFFLE = "com.thali.widget.SHUFFLE"
+                  const val GLASS_ML = 250
+
+                  fun updateAll(ctx: Context, updating: Boolean = false) {
+                      val mgr = AppWidgetManager.getInstance(ctx)
+                      mgr.getAppWidgetIds(ComponentName(ctx, ThaliWidget::class.java))
+                          .forEach { mgr.updateAppWidget(it, build(ctx, layoutFor(mgr, it, false), updating)) }
+                      mgr.getAppWidgetIds(ComponentName(ctx, ThaliSuggestWidget::class.java))
+                          .forEach { mgr.updateAppWidget(it, build(ctx, layoutFor(mgr, it, true), updating)) }
+                  }
+
+                  /**
+                   * Picks the large layout (big rings, bigger text) when the widget is tall enough,
+                   * otherwise the compact one. Portrait height is reported as MAX_HEIGHT.
+                   */
+                  fun layoutFor(mgr: AppWidgetManager, id: Int, suggest: Boolean): Int {
+                      val opts = mgr.getAppWidgetOptions(id)
+                      val h = opts.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT, 0)
+                      val w = opts.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 0)
+                      val narrow = w in 1..299
+                      return if (suggest) {
+                          if (!narrow && (h == 0 || h >= 280)) R.layout.widget_suggest else R.layout.widget_suggest_compact
+                      } else {
+                          if (!narrow && (h == 0 || h >= 175)) R.layout.widget else R.layout.widget_compact
+                      }
+                  }
+
+                  private fun build(ctx: Context, layoutId: Int, updating: Boolean = false): RemoteViews {
+                      val v = RemoteViews(ctx.packageName, layoutId)
+                      val withSuggestion = layoutId == R.layout.widget_suggest || layoutId == R.layout.widget_suggest_compact
+                      val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+
+                      // Buttons
+                      val refresh = Intent(ctx, ThaliWidget::class.java).setAction(ACTION_REFRESH)
+                      v.setOnClickPendingIntent(R.id.refresh, PendingIntent.getBroadcast(ctx, 1, refresh, flags))
+                      val water = Intent(ctx, ThaliWidget::class.java).setAction(ACTION_WATER)
+                      v.setOnClickPendingIntent(R.id.add_water, PendingIntent.getBroadcast(ctx, 3, water, flags))
+
+                      // Tapping the widget or "+ Food" opens the tracker (or this app if no link yet)
+                      val appUrl = ThaliData.appUrl(ctx)
+                      val open = if (appUrl.startsWith("http")) Intent(Intent.ACTION_VIEW, Uri.parse(appUrl))
+                                 else Intent(ctx, MainActivity::class.java)
+                      open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      val openPi = PendingIntent.getActivity(ctx, 2, open, flags)
+                      v.setOnClickPendingIntent(R.id.root, openPi)
+                      v.setOnClickPendingIntent(R.id.add_food, openPi)
+                      if (withSuggestion) {
+                          v.setOnClickPendingIntent(R.id.sugg_box, openPi)
+                          val shuffle = Intent(ctx, ThaliWidget::class.java).setAction(ACTION_SHUFFLE)
+                          v.setOnClickPendingIntent(R.id.sugg_next, PendingIntent.getBroadcast(ctx, 4, shuffle, flags))
+                      }
+
+                      val data = ThaliData.cached(ctx)
+                      if (data == null) {
+                          listOf(R.id.kcal_val, R.id.prot_val, R.id.water_val).forEach { v.setTextViewText(it, "–") }
+                          listOf(R.id.kcal_sub, R.id.prot_sub, R.id.water_sub).forEach { v.setTextViewText(it, "") }
+                          listOf(R.id.kcal_ring, R.id.prot_ring, R.id.water_ring).forEach { v.setProgressBar(it, 100, 0, false) }
+                          v.setViewVisibility(R.id.kcal_ring_over, View.GONE)
+                          v.setTextViewText(R.id.updated, when {
+                              updating -> ctx.getString(R.string.updating)
+                              ThaliData.link(ctx).isBlank() -> ctx.getString(R.string.widget_setup)
+                              else -> ThaliData.lastError(ctx) ?: ctx.getString(R.string.widget_loading)
+                          })
+                          if (withSuggestion) v.setViewVisibility(R.id.sugg_box, View.GONE)
+                          return v
+                      }
+
+                      // Calories
+                      val total = data.optInt("total")
+                      val goal = data.optInt("goal", 2000).coerceAtLeast(1)
+                      val left = goal - total
+                      val over = left < 0
+                      v.setTextViewText(R.id.kcal_val, ThaliData.fmt(total))
+                      v.setTextViewText(R.id.kcal_sub, if (over) "+${ThaliData.fmt(-left)} over" else "of " + ThaliData.fmt(goal))
+                      v.setTextColor(R.id.kcal_sub, ctx.getColor(if (over) R.color.chilli else R.color.muted))
+                      v.setProgressBar(R.id.kcal_ring, 100, (total * 100 / goal).coerceIn(0, 100), false)
+                      v.setViewVisibility(R.id.kcal_ring_over, if (over) View.VISIBLE else View.GONE)
+                      v.setTextColor(R.id.kcal_val, ctx.getColor(if (over) R.color.chilli else R.color.ink))
+
+                      // Protein
+                      val protein = data.optDouble("protein", 0.0)
+                      val pGoal = data.optInt("proteinGoal", 60).coerceAtLeast(1)
+                      v.setTextViewText(R.id.prot_val, ThaliData.fmt1(protein) + " g")
+                      v.setTextViewText(R.id.prot_sub, "of $pGoal g")
+                      v.setProgressBar(R.id.prot_ring, 100, (protein * 100 / pGoal).toInt().coerceIn(0, 100), false)
+                      v.setTextColor(R.id.prot_val, ctx.getColor(R.color.protein))
+                      v.setTextViewText(R.id.prot_label, if (protein >= pGoal) "Protein ✓" else "Protein")
+
+                      // Water
+                      val waterMl = data.optInt("water")
+                      val wGoal = data.optInt("waterGoal", 2500).coerceAtLeast(1)
+                      v.setTextViewText(R.id.water_val, ThaliData.litres(waterMl))
+                      v.setTextViewText(R.id.water_sub, "of " + ThaliData.litres(wGoal))
+                      v.setProgressBar(R.id.water_ring, 100, (waterMl * 100 / wGoal).coerceIn(0, 100), false)
+                      v.setTextColor(R.id.water_val, ctx.getColor(R.color.water))
+                      v.setTextViewText(R.id.water_label, if (waterMl >= wGoal) "Water ✓" else "Water")
+
+
+                      // Suggestion (taller widget only)
+                      if (withSuggestion) {
+                          val sg = data.optJSONObject("suggestion")
+                          val food = sg?.optString("food").orEmpty()
+                          if (sg == null || food.isBlank()) {
+                              v.setViewVisibility(R.id.sugg_box, View.GONE)
+                          } else {
+                              v.setViewVisibility(R.id.sugg_box, View.VISIBLE)
+                              v.setTextViewText(R.id.sugg_msg, sg.optString("short").ifBlank { sg.optString("message") })
+                              v.setTextViewText(R.id.sugg_food, food)
+                              val sp = sg.optDouble("protein", 0.0)
+                              v.setTextViewText(R.id.sugg_meta, "${sg.optString("serving")}, ${ThaliData.fmt(sg.optInt("calories"))} kcal, ${ThaliData.fmt1(sp)} g protein")
+                          }
+                      }
+
+                      val err = ThaliData.lastError(ctx)
+                      val time = DateFormat.getTimeFormat(ctx).format(Date(ThaliData.fetchedAt(ctx)))
+                      v.setTextViewText(R.id.updated, when {
+                          updating -> ctx.getString(R.string.updating)
+                          err != null -> "Offline $time"
+                          else -> time
+                      })
+                      return v
+                  }
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/btn_bg.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/leaf" />
+              <corners android:radius="14dp" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/btn_soft.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/track" />
+              <corners android:radius="14dp" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_foreground.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#00000000" android:strokeColor="#2F5D3A" android:strokeWidth="4"
+                  android:pathData="M54,28a26,26 0 1,1 0,52a26,26 0 1,1 0,-52z" />
+              <path android:fillColor="#D2920C" android:pathData="M45,40a6,6 0 1,1 0,12a6,6 0 1,1 0,-12z" />
+              <path android:fillColor="#E26A16" android:pathData="M63,40a6,6 0 1,1 0,12a6,6 0 1,1 0,-12z" />
+              <path android:fillColor="#2F5D3A" android:pathData="M45,56a6,6 0 1,1 0,12a6,6 0 1,1 0,-12z" />
+              <path android:fillColor="#6A4C93" android:pathData="M63,56a6,6 0 1,1 0,12a6,6 0 1,1 0,-12z" />
+          </vector>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/input_bg.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/bg" />
+              <stroke android:width="1.5dp" android:color="@color/track" />
+              <corners android:radius="14dp" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/logo_small.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="20dp" android:height="20dp" android:viewportWidth="40" android:viewportHeight="40">
+              <path android:fillColor="#00000000" android:strokeColor="@color/leaf" android:strokeWidth="3"
+                  android:pathData="M20,2a18,18 0 1,1 0,36a18,18 0 1,1 0,-36z" />
+              <path android:fillColor="#D2920C" android:pathData="M14,11a4,4 0 1,1 0,8a4,4 0 1,1 0,-8z" />
+              <path android:fillColor="#E26A16" android:pathData="M26,11a4,4 0 1,1 0,8a4,4 0 1,1 0,-8z" />
+              <path android:fillColor="#2F5D3A" android:pathData="M14,22a4,4 0 1,1 0,8a4,4 0 1,1 0,-8z" />
+              <path android:fillColor="#6A4C93" android:pathData="M26,22a4,4 0 1,1 0,8a4,4 0 1,1 0,-8z" />
+          </vector>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/pill_food.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/leaf_soft" />
+              <corners android:radius="16dp" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/pill_water.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/water_soft" />
+              <corners android:radius="16dp" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ring_kcal.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:id="@android:id/background">
+                  <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="false">
+                      <solid android:color="@color/leaf_soft" />
+                  </shape>
+              </item>
+              <item android:id="@android:id/progress">
+                  <rotate android:fromDegrees="270" android:toDegrees="270" android:pivotX="50%" android:pivotY="50%">
+                      <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="true">
+                          <solid android:color="@color/leaf" />
+                      </shape>
+                  </rotate>
+              </item>
+          </layer-list>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ring_over.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:id="@android:id/background">
+                  <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="false">
+                      <solid android:color="@color/leaf_soft" />
+                  </shape>
+              </item>
+              <item android:id="@android:id/progress">
+                  <rotate android:fromDegrees="270" android:toDegrees="270" android:pivotX="50%" android:pivotY="50%">
+                      <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="true">
+                          <solid android:color="@color/chilli" />
+                      </shape>
+                  </rotate>
+              </item>
+          </layer-list>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ring_protein.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:id="@android:id/background">
+                  <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="false">
+                      <solid android:color="@color/protein_soft" />
+                  </shape>
+              </item>
+              <item android:id="@android:id/progress">
+                  <rotate android:fromDegrees="270" android:toDegrees="270" android:pivotX="50%" android:pivotY="50%">
+                      <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="true">
+                          <solid android:color="@color/protein" />
+                      </shape>
+                  </rotate>
+              </item>
+          </layer-list>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ring_water.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:id="@android:id/background">
+                  <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="false">
+                      <solid android:color="@color/water_soft" />
+                  </shape>
+              </item>
+              <item android:id="@android:id/progress">
+                  <rotate android:fromDegrees="270" android:toDegrees="270" android:pivotX="50%" android:pivotY="50%">
+                      <shape android:shape="ring" android:innerRadiusRatio="2.45" android:thicknessRatio="10" android:useLevel="true">
+                          <solid android:color="@color/water" />
+                      </shape>
+                  </rotate>
+              </item>
+          </layer-list>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/round_btn.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="@color/bg" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/sugg_bg.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/sugg_bg" />
+              <stroke android:width="1dp" android:color="@color/sugg_line" />
+              <corners android:radius="18dp" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/widget_bg.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/bg" />
+              <corners android:radius="26dp" />
+          </shape>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fitsSystemWindows="true">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="24dp">
+
+                  <ImageView
+                      android:layout_width="72dp"
+                      android:layout_height="72dp"
+                      android:layout_gravity="center_horizontal"
+                      android:src="@drawable/ic_foreground"
+                      android:contentDescription="@null" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:gravity="center"
+                      android:text="@string/app_name"
+                      android:textColor="@color/ink"
+                      android:textSize="28sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:layout_marginBottom="20dp"
+                      android:text="@string/intro"
+                      android:textColor="@color/muted"
+                      android:textSize="15sp" />
+
+                  <EditText
+                      android:id="@+id/link_input"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:background="@drawable/input_bg"
+                      android:padding="14dp"
+                      android:hint="@string/link_hint"
+                      android:inputType="textUri"
+                      android:minLines="2"
+                      android:textColor="@color/ink"
+                      android:textColorHint="@color/muted"
+                      android:textSize="14sp" />
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:orientation="horizontal">
+
+                      <Button
+                          android:id="@+id/paste"
+                          android:layout_width="0dp"
+                          android:layout_height="52dp"
+                          android:layout_weight="1"
+                          android:layout_marginEnd="8dp"
+                          android:background="@drawable/btn_soft"
+                          android:text="@string/paste"
+                          android:textAllCaps="false"
+                          android:textColor="@color/ink" />
+
+                      <Button
+                          android:id="@+id/save"
+                          android:layout_width="0dp"
+                          android:layout_height="52dp"
+                          android:layout_weight="2"
+                          android:background="@drawable/btn_bg"
+                          android:text="@string/save"
+                          android:textAllCaps="false"
+                          android:textColor="#FFFFFFFF" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/result"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="20dp"
+                      android:textColor="@color/ink"
+                      android:textSize="15sp" />
+
+                  <Button
+                      android:id="@+id/open_app"
+                      android:layout_width="match_parent"
+                      android:layout_height="52dp"
+                      android:layout_marginTop="20dp"
+                      android:background="@drawable/btn_soft"
+                      android:text="@string/open_app"
+                      android:textAllCaps="false"
+                      android:textColor="@color/ink" />
+              </LinearLayout>
+          </ScrollView>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/widget.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:orientation="vertical"
+              android:paddingStart="16dp"
+              android:paddingTop="14dp"
+              android:paddingEnd="12dp"
+              android:paddingBottom="16dp">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <ImageView
+                      android:layout_width="24dp"
+                      android:layout_height="24dp"
+                      android:contentDescription="@null"
+                      android:src="@drawable/logo_small" />
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="8dp"
+                      android:layout_weight="1"
+                      android:orientation="vertical">
+
+                      <TextView
+                          android:id="@+id/title"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:includeFontPadding="false"
+                          android:text="@string/widget_name"
+                          android:textColor="@color/ink"
+                          android:textSize="17sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/updated"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="2dp"
+                          android:ellipsize="end"
+                          android:includeFontPadding="false"
+                          android:maxLines="1"
+                          android:textColor="@color/muted"
+                          android:textSize="11sp" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/add_water"
+                      android:layout_width="wrap_content"
+                      android:layout_height="34dp"
+                      android:background="@drawable/pill_water"
+                      android:gravity="center"
+                      android:paddingStart="12dp"
+                      android:paddingEnd="12dp"
+                      android:text="@string/add_water"
+                      android:textColor="@color/water"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/add_food"
+                      android:layout_width="wrap_content"
+                      android:layout_height="34dp"
+                      android:layout_marginStart="6dp"
+                      android:background="@drawable/pill_food"
+                      android:gravity="center"
+                      android:paddingStart="12dp"
+                      android:paddingEnd="12dp"
+                      android:text="@string/add_food"
+                      android:textColor="@color/leaf"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/refresh"
+                      android:layout_width="34dp"
+                      android:layout_height="34dp"
+                      android:contentDescription="@string/refresh"
+                      android:gravity="center"
+                      android:text="↻"
+                      android:textColor="@color/muted"
+                      android:textSize="20sp" />
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="8dp"
+                  android:layout_weight="1"
+                  android:gravity="center"
+                  android:orientation="horizontal">
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="88dp"
+                          android:layout_height="88dp">
+
+                          <ProgressBar
+                              android:id="@+id/kcal_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_kcal" />
+                          <ProgressBar
+                              android:id="@+id/kcal_ring_over"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="100"
+                              android:progressDrawable="@drawable/ring_over"
+                              android:visibility="gone" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/kcal_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="20sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/kcal_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/kcal_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:text="Calories"
+                          android:textColor="@color/ink"
+                          android:textSize="15sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="88dp"
+                          android:layout_height="88dp">
+
+                          <ProgressBar
+                              android:id="@+id/prot_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_protein" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/prot_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="20sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/prot_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/prot_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:text="Protein"
+                          android:textColor="@color/ink"
+                          android:textSize="15sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="88dp"
+                          android:layout_height="88dp">
+
+                          <ProgressBar
+                              android:id="@+id/water_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_water" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/water_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="20sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/water_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/water_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:text="Water"
+                          android:textColor="@color/ink"
+                          android:textSize="15sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+              </LinearLayout>
+
+          </LinearLayout>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/widget_compact.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:orientation="vertical"
+              android:paddingStart="14dp"
+              android:paddingTop="12dp"
+              android:paddingEnd="10dp"
+              android:paddingBottom="14dp">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <ImageView
+                      android:layout_width="23dp"
+                      android:layout_height="23dp"
+                      android:contentDescription="@null"
+                      android:src="@drawable/logo_small" />
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="8dp"
+                      android:layout_weight="1"
+                      android:orientation="vertical">
+
+                      <TextView
+                          android:id="@+id/title"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:includeFontPadding="false"
+                          android:text="@string/widget_name"
+                          android:textColor="@color/ink"
+                          android:textSize="16sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/updated"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="2dp"
+                          android:ellipsize="end"
+                          android:includeFontPadding="false"
+                          android:maxLines="1"
+                          android:textColor="@color/muted"
+                          android:textSize="11sp" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/add_water"
+                      android:layout_width="wrap_content"
+                      android:layout_height="32dp"
+                      android:background="@drawable/pill_water"
+                      android:gravity="center"
+                      android:paddingStart="10dp"
+                      android:paddingEnd="10dp"
+                      android:text="@string/add_water"
+                      android:textColor="@color/water"
+                      android:textSize="13sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/add_food"
+                      android:layout_width="wrap_content"
+                      android:layout_height="32dp"
+                      android:layout_marginStart="6dp"
+                      android:background="@drawable/pill_food"
+                      android:gravity="center"
+                      android:paddingStart="10dp"
+                      android:paddingEnd="10dp"
+                      android:text="@string/add_food"
+                      android:textColor="@color/leaf"
+                      android:textSize="13sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/refresh"
+                      android:layout_width="34dp"
+                      android:layout_height="34dp"
+                      android:contentDescription="@string/refresh"
+                      android:gravity="center"
+                      android:text="↻"
+                      android:textColor="@color/muted"
+                      android:textSize="19sp" />
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="6dp"
+                  android:layout_weight="1"
+                  android:gravity="center"
+                  android:orientation="horizontal">
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="70dp"
+                          android:layout_height="70dp">
+
+                          <ProgressBar
+                              android:id="@+id/kcal_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_kcal" />
+                          <ProgressBar
+                              android:id="@+id/kcal_ring_over"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="100"
+                              android:progressDrawable="@drawable/ring_over"
+                              android:visibility="gone" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/kcal_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="15sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/kcal_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="11sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/kcal_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="4dp"
+                          android:text="Calories"
+                          android:textColor="@color/ink"
+                          android:textSize="13sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="70dp"
+                          android:layout_height="70dp">
+
+                          <ProgressBar
+                              android:id="@+id/prot_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_protein" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/prot_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="15sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/prot_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="11sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/prot_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="4dp"
+                          android:text="Protein"
+                          android:textColor="@color/ink"
+                          android:textSize="13sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="70dp"
+                          android:layout_height="70dp">
+
+                          <ProgressBar
+                              android:id="@+id/water_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_water" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/water_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="15sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/water_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="11sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/water_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="4dp"
+                          android:text="Water"
+                          android:textColor="@color/ink"
+                          android:textSize="13sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+              </LinearLayout>
+
+          </LinearLayout>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/widget_suggest.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:orientation="vertical"
+              android:paddingStart="16dp"
+              android:paddingTop="14dp"
+              android:paddingEnd="12dp"
+              android:paddingBottom="16dp">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <ImageView
+                      android:layout_width="24dp"
+                      android:layout_height="24dp"
+                      android:contentDescription="@null"
+                      android:src="@drawable/logo_small" />
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="8dp"
+                      android:layout_weight="1"
+                      android:orientation="vertical">
+
+                      <TextView
+                          android:id="@+id/title"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:includeFontPadding="false"
+                          android:text="@string/widget_name"
+                          android:textColor="@color/ink"
+                          android:textSize="17sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/updated"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="2dp"
+                          android:ellipsize="end"
+                          android:includeFontPadding="false"
+                          android:maxLines="1"
+                          android:textColor="@color/muted"
+                          android:textSize="11sp" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/add_water"
+                      android:layout_width="wrap_content"
+                      android:layout_height="34dp"
+                      android:background="@drawable/pill_water"
+                      android:gravity="center"
+                      android:paddingStart="12dp"
+                      android:paddingEnd="12dp"
+                      android:text="@string/add_water"
+                      android:textColor="@color/water"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/add_food"
+                      android:layout_width="wrap_content"
+                      android:layout_height="34dp"
+                      android:layout_marginStart="6dp"
+                      android:background="@drawable/pill_food"
+                      android:gravity="center"
+                      android:paddingStart="12dp"
+                      android:paddingEnd="12dp"
+                      android:text="@string/add_food"
+                      android:textColor="@color/leaf"
+                      android:textSize="14sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/refresh"
+                      android:layout_width="34dp"
+                      android:layout_height="34dp"
+                      android:contentDescription="@string/refresh"
+                      android:gravity="center"
+                      android:text="↻"
+                      android:textColor="@color/muted"
+                      android:textSize="20sp" />
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="10dp"
+                  android:layout_weight="1"
+                  android:gravity="center"
+                  android:orientation="horizontal">
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="88dp"
+                          android:layout_height="88dp">
+
+                          <ProgressBar
+                              android:id="@+id/kcal_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_kcal" />
+                          <ProgressBar
+                              android:id="@+id/kcal_ring_over"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="100"
+                              android:progressDrawable="@drawable/ring_over"
+                              android:visibility="gone" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/kcal_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="20sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/kcal_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/kcal_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="8dp"
+                          android:text="Calories"
+                          android:textColor="@color/ink"
+                          android:textSize="16sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="88dp"
+                          android:layout_height="88dp">
+
+                          <ProgressBar
+                              android:id="@+id/prot_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_protein" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/prot_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="20sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/prot_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/prot_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="8dp"
+                          android:text="Protein"
+                          android:textColor="@color/ink"
+                          android:textSize="16sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="88dp"
+                          android:layout_height="88dp">
+
+                          <ProgressBar
+                              android:id="@+id/water_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_water" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/water_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="20sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/water_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/water_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="8dp"
+                          android:text="Water"
+                          android:textColor="@color/ink"
+                          android:textSize="16sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+              </LinearLayout>
+
+              <LinearLayout
+                  android:id="@+id/sugg_box"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="10dp"
+                  android:background="@drawable/sugg_bg"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal"
+                  android:paddingStart="14dp"
+                  android:paddingTop="9dp"
+                  android:paddingEnd="8dp"
+                  android:paddingBottom="9dp">
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:orientation="vertical">
+
+                      <TextView
+                          android:id="@+id/sugg_msg"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:ellipsize="end"
+                          android:maxLines="1"
+                          android:textColor="@color/muted"
+                          android:textSize="13sp" />
+
+                      <TextView
+                          android:id="@+id/sugg_food"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="3dp"
+                          android:ellipsize="end"
+                          android:maxLines="1"
+                          android:textColor="@color/ink"
+                          android:textSize="19sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/sugg_meta"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="1dp"
+                          android:ellipsize="end"
+                          android:maxLines="1"
+                          android:textColor="@color/protein"
+                          android:textSize="15sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/sugg_next"
+                      android:layout_width="48dp"
+                      android:layout_height="48dp"
+                      android:layout_marginStart="8dp"
+                      android:background="@drawable/round_btn"
+                      android:contentDescription="@string/another"
+                      android:gravity="center"
+                      android:text="⟳"
+                      android:textColor="@color/turmeric"
+                      android:textSize="22sp"
+                      android:textStyle="bold" />
+              </LinearLayout>
+
+          </LinearLayout>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/widget_suggest_compact.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:orientation="vertical"
+              android:paddingStart="14dp"
+              android:paddingTop="12dp"
+              android:paddingEnd="10dp"
+              android:paddingBottom="14dp">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+
+                  <ImageView
+                      android:layout_width="23dp"
+                      android:layout_height="23dp"
+                      android:contentDescription="@null"
+                      android:src="@drawable/logo_small" />
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="8dp"
+                      android:layout_weight="1"
+                      android:orientation="vertical">
+
+                      <TextView
+                          android:id="@+id/title"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:includeFontPadding="false"
+                          android:text="@string/widget_name"
+                          android:textColor="@color/ink"
+                          android:textSize="16sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/updated"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="2dp"
+                          android:ellipsize="end"
+                          android:includeFontPadding="false"
+                          android:maxLines="1"
+                          android:textColor="@color/muted"
+                          android:textSize="11sp" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/add_water"
+                      android:layout_width="wrap_content"
+                      android:layout_height="32dp"
+                      android:background="@drawable/pill_water"
+                      android:gravity="center"
+                      android:paddingStart="10dp"
+                      android:paddingEnd="10dp"
+                      android:text="@string/add_water"
+                      android:textColor="@color/water"
+                      android:textSize="13sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/add_food"
+                      android:layout_width="wrap_content"
+                      android:layout_height="32dp"
+                      android:layout_marginStart="6dp"
+                      android:background="@drawable/pill_food"
+                      android:gravity="center"
+                      android:paddingStart="10dp"
+                      android:paddingEnd="10dp"
+                      android:text="@string/add_food"
+                      android:textColor="@color/leaf"
+                      android:textSize="13sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/refresh"
+                      android:layout_width="34dp"
+                      android:layout_height="34dp"
+                      android:contentDescription="@string/refresh"
+                      android:gravity="center"
+                      android:text="↻"
+                      android:textColor="@color/muted"
+                      android:textSize="19sp" />
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_marginTop="8dp"
+                  android:layout_weight="1"
+                  android:gravity="center"
+                  android:orientation="horizontal">
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="78dp"
+                          android:layout_height="78dp">
+
+                          <ProgressBar
+                              android:id="@+id/kcal_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_kcal" />
+                          <ProgressBar
+                              android:id="@+id/kcal_ring_over"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="100"
+                              android:progressDrawable="@drawable/ring_over"
+                              android:visibility="gone" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/kcal_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="17sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/kcal_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/kcal_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:text="Calories"
+                          android:textColor="@color/ink"
+                          android:textSize="14sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="78dp"
+                          android:layout_height="78dp">
+
+                          <ProgressBar
+                              android:id="@+id/prot_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_protein" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/prot_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="17sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/prot_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/prot_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:text="Protein"
+                          android:textColor="@color/ink"
+                          android:textSize="14sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:gravity="center_horizontal"
+                      android:orientation="vertical">
+
+                      <FrameLayout
+                          android:layout_width="78dp"
+                          android:layout_height="78dp">
+
+                          <ProgressBar
+                              android:id="@+id/water_ring"
+                              style="@android:style/Widget.ProgressBar.Horizontal"
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:indeterminate="false"
+                              android:max="100"
+                              android:progress="0"
+                              android:progressDrawable="@drawable/ring_water" />
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="match_parent"
+                              android:gravity="center"
+                              android:orientation="vertical">
+
+                              <TextView
+                                  android:id="@+id/water_val"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:text="–"
+                                  android:textColor="@color/ink"
+                                  android:textSize="17sp"
+                                  android:textStyle="bold" />
+
+                              <TextView
+                                  android:id="@+id/water_sub"
+                                  android:layout_width="wrap_content"
+                                  android:layout_height="wrap_content"
+                                  android:layout_marginTop="1dp"
+                                  android:includeFontPadding="false"
+                                  android:maxLines="1"
+                                  android:textColor="@color/muted"
+                                  android:textSize="12sp" />
+                          </LinearLayout>
+                      </FrameLayout>
+
+                      <TextView
+                          android:id="@+id/water_label"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="6dp"
+                          android:text="Water"
+                          android:textColor="@color/ink"
+                          android:textSize="14sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+              </LinearLayout>
+
+              <LinearLayout
+                  android:id="@+id/sugg_box"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:background="@drawable/sugg_bg"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal"
+                  android:paddingStart="14dp"
+                  android:paddingTop="9dp"
+                  android:paddingEnd="8dp"
+                  android:paddingBottom="9dp">
+
+                  <LinearLayout
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:orientation="vertical">
+
+                      <TextView
+                          android:id="@+id/sugg_msg"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:ellipsize="end"
+                          android:maxLines="1"
+                          android:textColor="@color/muted"
+                          android:textSize="12sp" />
+
+                      <TextView
+                          android:id="@+id/sugg_food"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="3dp"
+                          android:ellipsize="end"
+                          android:maxLines="1"
+                          android:textColor="@color/ink"
+                          android:textSize="16sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/sugg_meta"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="1dp"
+                          android:ellipsize="end"
+                          android:maxLines="1"
+                          android:textColor="@color/protein"
+                          android:textSize="13sp"
+                          android:textStyle="bold" />
+                  </LinearLayout>
+
+                  <TextView
+                      android:id="@+id/sugg_next"
+                      android:layout_width="48dp"
+                      android:layout_height="48dp"
+                      android:layout_marginStart="8dp"
+                      android:background="@drawable/round_btn"
+                      android:contentDescription="@string/another"
+                      android:gravity="center"
+                      android:text="⟳"
+                      android:textColor="@color/turmeric"
+                      android:textSize="22sp"
+                      android:textStyle="bold" />
+              </LinearLayout>
+
+          </LinearLayout>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@android:color/white" />
+              <foreground android:drawable="@drawable/ic_foreground" />
+          </adaptive-icon>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/values-night
+          cat > app/src/main/res/values-night/colors.xml <<'THALI_EOF'
+          <resources>
+              <color name="bg">#FF182019</color>
+              <color name="ink">#FFE8EEE5</color>
+              <color name="muted">#FF9DA9A0</color>
+              <color name="track">#FF2B362D</color>
+              <color name="leaf">#FF7DBB8A</color>
+              <color name="leaf_soft">#FF23362A</color>
+              <color name="chilli">#FFEC6B56</color>
+              <color name="water">#FF6DB6EA</color>
+              <color name="water_soft">#FF1B2C38</color>
+              <color name="protein">#FFE08BC4</color>
+              <color name="protein_soft">#FF3A2333</color>
+              <color name="turmeric">#FFF0B840</color>
+              <color name="screen">#FF0F1510</color>
+              <color name="sugg_bg">#FF2A2617</color>
+              <color name="sugg_line">#FF5A4A22</color>
+          </resources>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/values-night
+          cat > app/src/main/res/values-night/themes.xml <<'THALI_EOF'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:colorPrimary">@color/leaf</item>
+                  <item name="android:colorAccent">@color/leaf</item>
+                  <item name="android:windowBackground">@color/screen</item>
+                  <item name="android:statusBarColor">@color/screen</item>
+              </style>
+          </resources>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'THALI_EOF'
+          <resources>
+              <color name="bg">#FFFFFFFF</color>
+              <color name="ink">#FF1D2920</color>
+              <color name="muted">#FF5A685E</color>
+              <color name="track">#FFE3E9DE</color>
+              <color name="leaf">#FF2F5D3A</color>
+              <color name="leaf_soft">#FFE4EFE3</color>
+              <color name="chilli">#FFBF3626</color>
+              <color name="water">#FF2B7BB9</color>
+              <color name="water_soft">#FFDCEBF6</color>
+              <color name="protein">#FF9A3D7A</color>
+              <color name="protein_soft">#FFF6E4EF</color>
+              <color name="turmeric">#FFD2920C</color>
+              <color name="screen">#FFF3F6F0</color>
+              <color name="sugg_bg">#FFFBF3E2</color>
+              <color name="sugg_line">#FFEBD3A0</color>
+          </resources>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'THALI_EOF'
+          <resources>
+              <string name="app_name">Thali Widget</string>
+              <string name="widget_name">Thali</string>
+              <string name="widget_desc">Today’s calories, protein and water from your Thali tracker</string>
+              <string name="widget_setup">Open the Thali Widget app and paste your link</string>
+              <string name="widget_loading">Loading…</string>
+              <string name="updating">Updating…</string>
+              <string name="intro">Paste the widget link from Thali (Me tab → Show my widget link → Copy the data link). Then add the Thali widget to your home screen.</string>
+              <string name="link_hint">https://script.google.com/macros/s/…/exec?widget=…</string>
+              <string name="paste">Paste</string>
+              <string name="save">Save and test</string>
+              <string name="open_app">Open Thali tracker</string>
+              <string name="testing">Checking your link…</string>
+              <string name="clipboard_empty">Nothing copied yet. Copy the data link from Thali first.</string>
+              <string name="bad_link">That doesn’t look like a Thali widget link. It should start with https://script.google.com/ and contain widget=</string>
+              <string name="need_link">Save your link first.</string>
+              <string name="add_widget_hint">Now go to your home screen, long-press an empty spot, tap Widgets, and find Thali Widget. There are two: Thali (rings) and Thali + suggestion (rings plus what to eat next).</string>
+              <string name="refresh">Refresh</string>
+              <string name="add_water">+ Glass</string>
+              <string name="add_food">+ Food</string>
+              <string name="widget_suggest_name">Thali + suggestion</string>
+              <string name="widget_suggest_desc">Calories, protein and water, plus what to eat next</string>
+              <string name="another">Another suggestion</string>
+          </resources>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'THALI_EOF'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:colorPrimary">@color/leaf</item>
+                  <item name="android:colorAccent">@color/leaf</item>
+                  <item name="android:windowBackground">@color/screen</item>
+                  <item name="android:statusBarColor">@color/screen</item>
+              </style>
+          </resources>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/thali_widget_info.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp"
+              android:minHeight="150dp"
+              android:minResizeWidth="220dp"
+              android:minResizeHeight="140dp"
+              android:targetCellWidth="4"
+              android:targetCellHeight="2"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="1800000"
+              android:initialLayout="@layout/widget"
+              android:previewLayout="@layout/widget"
+              android:previewImage="@drawable/ic_foreground"
+              android:description="@string/widget_desc"
+              android:widgetCategory="home_screen" />
+          THALI_EOF
+
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/thali_widget_suggest_info.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp"
+              android:minHeight="210dp"
+              android:minResizeWidth="230dp"
+              android:minResizeHeight="200dp"
+              android:targetCellWidth="4"
+              android:targetCellHeight="3"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="1800000"
+              android:initialLayout="@layout/widget_suggest"
+              android:previewLayout="@layout/widget_suggest"
+              android:previewImage="@drawable/ic_foreground"
+              android:description="@string/widget_suggest_desc"
+              android:widgetCategory="home_screen" />
+          THALI_EOF
+
+          cat > build.gradle.kts <<'THALI_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          THALI_EOF
+
+          cat > gradle.properties <<'THALI_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          kotlin.code.style=official
+          THALI_EOF
+
+          cat > settings.gradle.kts <<'THALI_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ThaliWidget"
+          include(":app")
+          THALI_EOF
+
+          echo "Project files created:"
+          find . -type f | sort
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set +e
+          cd project
+          gradle assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build-log.txt"
+          STATUS=${PIPESTATUS[0]}
+          if [ $STATUS -ne 0 ]; then
+            echo "================ ERROR SUMMARY ================"
+            grep -B 5 -A 20 "What went wrong" "$GITHUB_WORKSPACE/build-log.txt" || tail -80 "$GITHUB_WORKSPACE/build-log.txt"
+            grep -E "^e: |error:" "$GITHUB_WORKSPACE/build-log.txt" | head -40
+            exit $STATUS
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/out/"
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: thali-widget-apk
+          path: out/app-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build-log.txt
