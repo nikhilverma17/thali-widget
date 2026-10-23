@@ -1,5 +1,5 @@
 name: Build APK
-# This one file contains the whole Thali Widget Android app (v4.0: full Thali app + widgets).
+# This one file contains the whole Thali Widget Android app (v4.1: full Thali app, widgets and reminders).
 # It creates the project on GitHub's machine and builds the APK,
 # so nothing else needs to be uploaded to the repository.
 
@@ -41,8 +41,8 @@ jobs:
                   applicationId = "com.thali.widget"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 5
-                  versionName = "4.0"
+                  versionCode = 6
+                  versionName = "4.1"
               }
 
               buildTypes {
@@ -67,6 +67,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
               <application
                   android:label="@string/app_name"
@@ -125,10 +126,13 @@ jobs:
           cat > app/src/main/java/com/thali/widget/AppActivity.kt <<'THALI_EOF'
           package com.thali.widget
 
+          import android.Manifest
           import android.annotation.SuppressLint
           import android.app.Activity
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
           import android.view.View
           import android.webkit.CookieManager
@@ -207,6 +211,15 @@ jobs:
                   }
 
                   if (savedInstanceState != null) w.restoreState(savedInstanceState) else w.loadUrl(url)
+
+                  // Reminders: create channels, schedule checks, and ask for permission once (Android 13+)
+                  Notif.channels(this)
+                  Reminders.schedule(this)
+                  if (Build.VERSION.SDK_INT >= 33 && !Reminders.askedPermission(this) &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      Reminders.setAskedPermission(this)
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7)
+                  }
               }
 
               override fun onSaveInstanceState(outState: Bundle) {
@@ -241,11 +254,19 @@ jobs:
           cat > app/src/main/java/com/thali/widget/MainActivity.kt <<'THALI_EOF'
           package com.thali.widget
 
+          import android.Manifest
           import android.app.Activity
           import android.content.ClipboardManager
           import android.content.Context
           import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
           import android.os.Bundle
+          import android.view.View
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Spinner
+          import android.widget.Switch
           import android.widget.Button
           import android.widget.EditText
           import android.widget.TextView
@@ -280,6 +301,65 @@ jobs:
                       } else result.text = getString(R.string.need_link)
                   }
                   showCached()
+                  setupReminders()
+              }
+
+              private fun setupReminders() {
+                  Notif.channels(this)
+                  val swWater = findViewById<Switch>(R.id.sw_water)
+                  val swBehind = findViewById<Switch>(R.id.sw_behind)
+                  val swMeals = findViewById<Switch>(R.id.sw_meals)
+                  val swProtein = findViewById<Switch>(R.id.sw_protein)
+                  val status = findViewById<TextView>(R.id.notif_status)
+
+                  swWater.isChecked = Reminders.waterOn(this)
+                  swBehind.isChecked = Reminders.onlyBehind(this)
+                  swMeals.isChecked = Reminders.mealsOn(this)
+                  swProtein.isChecked = Reminders.proteinOn(this)
+
+                  fun changed(turnedOn: Boolean) {
+                      if (turnedOn) askNotificationPermission()
+                      Reminders.schedule(this)
+                  }
+                  swWater.setOnCheckedChangeListener { _, on -> Reminders.put(this, "water_on", on); changed(on) }
+                  swBehind.setOnCheckedChangeListener { _, on -> Reminders.put(this, "only_behind", on) }
+                  swMeals.setOnCheckedChangeListener { _, on -> Reminders.put(this, "meals_on", on); changed(on) }
+                  swProtein.setOnCheckedChangeListener { _, on -> Reminders.put(this, "protein_on", on); changed(on) }
+
+                  bindSpinner(R.id.sp_every, listOf(60 to "1 hour", 90 to "1.5 hours", 120 to "2 hours", 180 to "3 hours"),
+                      Reminders.everyMin(this)) { Reminders.put(this, "water_every", it) }
+                  bindSpinner(R.id.sp_start, (5..12).map { it to hourLabel(it) }, Reminders.startHour(this)) { Reminders.put(this, "start_hour", it) }
+                  bindSpinner(R.id.sp_end, (17..24).map { it to hourLabel(it) }, Reminders.endHour(this)) { Reminders.put(this, "end_hour", it) }
+
+                  findViewById<Button>(R.id.test_notif).setOnClickListener {
+                      askNotificationPermission()
+                      Reminders.schedule(this)
+                      status.text = getString(if (Notif.test(this)) R.string.notif_sent else R.string.notif_blocked)
+                  }
+                  if (!Notif.canPost(this)) status.text = getString(R.string.notif_blocked)
+              }
+
+              private fun hourLabel(h: Int) = when {
+                  h == 24 -> "midnight"
+                  h == 12 -> "12 pm"
+                  h > 12 -> "${h - 12} pm"
+                  else -> "$h am"
+              }
+
+              private fun bindSpinner(id: Int, options: List<Pair<Int, String>>, current: Int, onPick: (Int) -> Unit) {
+                  val sp = findViewById<Spinner>(id)
+                  sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, options.map { it.second })
+                  sp.setSelection(options.indexOfFirst { it.first == current }.coerceAtLeast(0))
+                  sp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, rowId: Long) = onPick(options[position].first)
+                      override fun onNothingSelected(parent: AdapterView<*>?) {}
+                  }
+              }
+
+              private fun askNotificationPermission() {
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 8)
+                  }
               }
 
               private fun saveAndTest() {
@@ -309,6 +389,112 @@ jobs:
                   result.text = prefix + "Hi ${d.optString("name")}! Today: ${ThaliData.fmt(d.optInt("total"))} of " +
                       "${ThaliData.fmt(d.optInt("goal"))} kcal, water ${ThaliData.fmt(d.optInt("water"))} ml.\n\n" +
                       getString(R.string.add_widget_hint)
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/Notif.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationManagerCompat
+          import org.json.JSONObject
+
+          /** Builds and posts Thali reminders. */
+          object Notif {
+              const val EXTRA_NOTIF = "notif_id"
+              private const val CH_WATER = "water"
+              private const val CH_MEALS = "meals"
+              private const val ID_WATER = 101
+              private const val ID_MEAL = 102
+              private const val ID_PROTEIN = 105
+              private const val ID_TEST = 199
+              private val FLAGS = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+
+              fun channels(ctx: Context) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH_WATER, "Water reminders", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                      description = "Reminders to drink water during the day"
+                  })
+                  nm.createNotificationChannel(NotificationChannel(CH_MEALS, "Meal and protein reminders", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                      description = "Reminders to log meals and an evening protein check"
+                  })
+              }
+
+              fun canPost(ctx: Context): Boolean {
+                  if (!NotificationManagerCompat.from(ctx).areNotificationsEnabled()) return false
+                  return Build.VERSION.SDK_INT < 33 ||
+                      ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun openApp(ctx: Context) = PendingIntent.getActivity(
+                  ctx, 10, Intent(ctx, AppActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP), FLAGS)
+
+              private fun base(ctx: Context, channel: String, title: String, text: String, colorRes: Int) =
+                  NotificationCompat.Builder(ctx, channel)
+                      .setSmallIcon(R.drawable.ic_notify)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                      .setColor(ctx.getColor(colorRes))
+                      .setContentIntent(openApp(ctx))
+                      .setAutoCancel(true)
+
+              fun water(ctx: Context, water: Int?, goal: Int?) {
+                  channels(ctx)
+                  val text = if (water != null && goal != null)
+                      "${ThaliData.fmt(water)} of ${ThaliData.fmt(goal)} ml so far. A glass now keeps you on track."
+                  else "Time for a glass of water."
+                  val b = base(ctx, CH_WATER, "Time to drink water 💧", text, R.color.water)
+                  if (ThaliData.link(ctx).contains("widget=")) {
+                      val add = Intent(ctx, ThaliWidget::class.java).setAction(ThaliWidget.ACTION_WATER).putExtra(EXTRA_NOTIF, ID_WATER)
+                      b.addAction(0, "+ Glass (250 ml)", PendingIntent.getBroadcast(ctx, 11, add, FLAGS))
+                  }
+                  post(ctx, ID_WATER, b.build())
+              }
+
+              fun meal(ctx: Context, meal: String) {
+                  channels(ctx)
+                  post(ctx, ID_MEAL, base(ctx, CH_MEALS, "Logged your ${meal.lowercase()}? 🍽️",
+                      "Add what you ate so your calories and protein stay right.", R.color.leaf).build())
+              }
+
+              fun protein(ctx: Context, protein: Double, goal: Int, suggestion: JSONObject?) {
+                  channels(ctx)
+                  var text = "You’re at ${ThaliData.fmt1(protein)} of $goal g protein today."
+                  val sg = suggestion
+                  val food = sg?.optString("food").orEmpty()
+                  text += if (sg != null && food.isNotBlank() && sg.optString("mode") == "protein")
+                      " Try $food (${ThaliData.fmt1(sg.optDouble("protein", 0.0))} g protein)."
+                  else " Paneer, eggs, dal, sprouts or curd can help close the gap."
+                  post(ctx, ID_PROTEIN, base(ctx, CH_MEALS, "Protein check 💪", text, R.color.protein).build())
+              }
+
+              fun test(ctx: Context): Boolean {
+                  channels(ctx)
+                  post(ctx, ID_TEST, base(ctx, CH_WATER, "Thali reminders are on 💧",
+                      "This is how your water, meal and protein reminders will look.", R.color.leaf).build())
+                  return canPost(ctx)
+              }
+
+              fun cancel(ctx: Context, id: Int) = NotificationManagerCompat.from(ctx).cancel(id)
+
+              @SuppressLint("MissingPermission")
+              private fun post(ctx: Context, id: Int, n: Notification) {
+                  if (!canPost(ctx)) return
+                  try { NotificationManagerCompat.from(ctx).notify(id, n) } catch (_: SecurityException) { }
               }
           }
           THALI_EOF
@@ -365,6 +551,126 @@ jobs:
                   fun cancel(ctx: Context) {
                       WorkManager.getInstance(ctx).cancelUniqueWork(PERIODIC)
                   }
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/ReminderWorker.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.content.Context
+          import androidx.work.CoroutineWorker
+          import androidx.work.WorkerParameters
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.util.Calendar
+
+          /** Decides whether a water, meal or protein reminder is due right now. */
+          class ReminderWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+
+              override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+                  val c = applicationContext
+                  val cal = Calendar.getInstance()
+                  val now = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+                  val start = Reminders.startHour(c) * 60
+                  val end = Reminders.endHour(c) * 60
+                  if (now < start || now >= end) return@withContext Result.success()   // quiet hours
+
+                  // Fresh numbers from Thali when the widget link is set up
+                  val hasLink = ThaliData.link(c).contains("widget=")
+                  if (hasLink) {
+                      ThaliData.refresh(c)
+                      ThaliWidget.updateAll(c)
+                  }
+                  val data = if (hasLink) ThaliData.cached(c)?.takeIf { it.optString("date") == Reminders.today() } else null
+
+                  // Water
+                  if (Reminders.waterOn(c) && System.currentTimeMillis() - Reminders.lastWater(c) >= Reminders.everyMin(c) * 60_000L) {
+                      val water = data?.optInt("water")
+                      val goal = data?.optInt("waterGoal", 2500)
+                      val reached = water != null && goal != null && water >= goal
+                      val expected = if (goal != null) goal * (now - start).toDouble() / (end - start) else null
+                      val behind = water == null || expected == null || water < expected - 200
+                      if (!reached && (behind || !Reminders.onlyBehind(c))) {
+                          Notif.water(c, water, goal)
+                          Reminders.setLastWater(c)
+                      } else if (reached) {
+                          Reminders.setLastWater(c)   // goal done: no nagging
+                      }
+                  }
+
+                  // Meals: remind only if nothing is logged for that meal yet
+                  if (Reminders.mealsOn(c)) {
+                      for ((meal, key, at) in listOf(Triple("Breakfast", "breakfast", 9 * 60 + 30), Triple("Lunch", "lunch", 14 * 60), Triple("Dinner", "dinner", 21 * 60))) {
+                          if (now >= at && now < at + 120 && !Reminders.sentToday(c, key)) {
+                              if (data == null || data.optInt(key, 0) == 0) Notif.meal(c, meal)
+                              Reminders.markSent(c, key)
+                          }
+                      }
+                  }
+
+                  // Evening protein check
+                  if (Reminders.proteinOn(c) && data != null && now >= 19 * 60 + 30 && !Reminders.sentToday(c, "protein")) {
+                      val protein = data.optDouble("protein", 0.0)
+                      val goal = data.optInt("proteinGoal", 60)
+                      if (protein < goal * 0.7) Notif.protein(c, protein, goal, data.optJSONObject("suggestion"))
+                      Reminders.markSent(c, "protein")
+                  }
+                  Result.success()
+              }
+          }
+          THALI_EOF
+
+          mkdir -p app/src/main/java/com/thali/widget
+          cat > app/src/main/java/com/thali/widget/Reminders.kt <<'THALI_EOF'
+          package com.thali.widget
+
+          import android.content.Context
+          import androidx.work.ExistingPeriodicWorkPolicy
+          import androidx.work.PeriodicWorkRequestBuilder
+          import androidx.work.WorkManager
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.TimeUnit
+
+          /** Reminder settings (stored on the phone) and scheduling. */
+          object Reminders {
+              private const val PREFS = "thali_reminders"
+              private const val WORK = "thali-reminders"
+              private fun p(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              fun waterOn(ctx: Context) = p(ctx).getBoolean("water_on", true)
+              fun everyMin(ctx: Context) = p(ctx).getInt("water_every", 90)
+              fun startHour(ctx: Context) = p(ctx).getInt("start_hour", 8)
+              fun endHour(ctx: Context) = p(ctx).getInt("end_hour", 22)
+              fun onlyBehind(ctx: Context) = p(ctx).getBoolean("only_behind", true)
+              fun mealsOn(ctx: Context) = p(ctx).getBoolean("meals_on", true)
+              fun proteinOn(ctx: Context) = p(ctx).getBoolean("protein_on", true)
+
+              fun put(ctx: Context, key: String, value: Boolean) = p(ctx).edit().putBoolean(key, value).apply()
+              fun put(ctx: Context, key: String, value: Int) = p(ctx).edit().putInt(key, value).apply()
+
+              fun lastWater(ctx: Context) = p(ctx).getLong("last_water", 0L)
+              fun setLastWater(ctx: Context, t: Long = System.currentTimeMillis()) = p(ctx).edit().putLong("last_water", t).apply()
+
+              fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+              fun sentToday(ctx: Context, key: String) = p(ctx).getString("sent_$key", "") == today()
+              fun markSent(ctx: Context, key: String) = p(ctx).edit().putString("sent_$key", today()).apply()
+
+              fun askedPermission(ctx: Context) = p(ctx).getBoolean("asked_permission", false)
+              fun setAskedPermission(ctx: Context) = put(ctx, "asked_permission", true)
+
+              /** Checks every 15 minutes (the shortest interval Android allows) whether a reminder is due. */
+              fun schedule(ctx: Context) {
+                  val wm = WorkManager.getInstance(ctx)
+                  if (!waterOn(ctx) && !mealsOn(ctx) && !proteinOn(ctx)) {
+                      wm.cancelUniqueWork(WORK)
+                      return
+                  }
+                  val req = PeriodicWorkRequestBuilder<ReminderWorker>(15, TimeUnit.MINUTES).build()
+                  wm.enqueueUniquePeriodicWork(WORK, ExistingPeriodicWorkPolicy.KEEP, req)
               }
           }
           THALI_EOF
@@ -574,6 +880,9 @@ jobs:
                       }
                       ACTION_WATER -> {
                           if (ThaliData.link(ctx).isBlank()) return
+                          val notifId = intent.getIntExtra(Notif.EXTRA_NOTIF, 0)
+                          if (notifId != 0) Notif.cancel(ctx, notifId)
+                          Reminders.setLastWater(ctx)
                           ThaliData.bumpWater(ctx, GLASS_ML)
                           updateAll(ctx, updating = true)
                           RefreshWorker.addWater(ctx, GLASS_ML)
@@ -738,6 +1047,17 @@ jobs:
               <path android:fillColor="#E26A16" android:pathData="M63,40a6,6 0 1,1 0,12a6,6 0 1,1 0,-12z" />
               <path android:fillColor="#2F5D3A" android:pathData="M45,56a6,6 0 1,1 0,12a6,6 0 1,1 0,-12z" />
               <path android:fillColor="#6A4C93" android:pathData="M63,56a6,6 0 1,1 0,12a6,6 0 1,1 0,-12z" />
+          </vector>
+          THALI_EOF
+
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_notify.xml <<'THALI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,2.5C12,2.5 5.5,9.6 5.5,14.2A6.5,6.5 0,0 0,18.5 14.2C18.5,9.6 12,2.5 12,2.5Z" />
           </vector>
           THALI_EOF
 
@@ -1064,6 +1384,136 @@ jobs:
                       android:text="@string/open_app"
                       android:textAllCaps="false"
                       android:textColor="@color/ink" />
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="32dp"
+                      android:text="@string/reminders_title"
+                      android:textColor="@color/ink"
+                      android:textSize="22sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="4dp"
+                      android:layout_marginBottom="8dp"
+                      android:text="@string/reminders_intro"
+                      android:textColor="@color/muted"
+                      android:textSize="14sp" />
+
+                  <Switch
+                      android:id="@+id/sw_water"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:minHeight="48dp"
+                      android:text="@string/sw_water"
+                      android:textColor="@color/ink"
+                      android:textSize="16sp" />
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:gravity="center_vertical"
+                      android:minHeight="48dp"
+                      android:orientation="horizontal">
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="@string/every"
+                          android:textColor="@color/muted"
+                          android:textSize="15sp" />
+
+                      <Spinner
+                          android:id="@+id/sp_every"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="8dp" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:gravity="center_vertical"
+                      android:minHeight="48dp"
+                      android:orientation="horizontal">
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="@string/from"
+                          android:textColor="@color/muted"
+                          android:textSize="15sp" />
+
+                      <Spinner
+                          android:id="@+id/sp_start"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="8dp" />
+
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="4dp"
+                          android:text="@string/to"
+                          android:textColor="@color/muted"
+                          android:textSize="15sp" />
+
+                      <Spinner
+                          android:id="@+id/sp_end"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="8dp" />
+                  </LinearLayout>
+
+                  <Switch
+                      android:id="@+id/sw_behind"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:minHeight="48dp"
+                      android:text="@string/sw_behind"
+                      android:textColor="@color/ink"
+                      android:textSize="15sp" />
+
+                  <Switch
+                      android:id="@+id/sw_meals"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:minHeight="48dp"
+                      android:text="@string/sw_meals"
+                      android:textColor="@color/ink"
+                      android:textSize="15sp" />
+
+                  <Switch
+                      android:id="@+id/sw_protein"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:minHeight="48dp"
+                      android:text="@string/sw_protein"
+                      android:textColor="@color/ink"
+                      android:textSize="15sp" />
+
+                  <Button
+                      android:id="@+id/test_notif"
+                      android:layout_width="match_parent"
+                      android:layout_height="52dp"
+                      android:layout_marginTop="16dp"
+                      android:background="@drawable/btn_soft"
+                      android:text="@string/test_notif"
+                      android:textAllCaps="false"
+                      android:textColor="@color/ink" />
+
+                  <TextView
+                      android:id="@+id/notif_status"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:layout_marginBottom="24dp"
+                      android:textColor="@color/muted"
+                      android:textSize="14sp" />
               </LinearLayout>
           </ScrollView>
           THALI_EOF
@@ -2483,6 +2933,18 @@ jobs:
               <string name="retry">Try again</string>
               <string name="link_settings">Link settings</string>
               <string name="settings_label">Thali link settings</string>
+              <string name="reminders_title">Reminders</string>
+              <string name="reminders_intro">Thali can remind you to drink water, log meals and check your protein. Reminders come only from this app.</string>
+              <string name="sw_water">Water reminders</string>
+              <string name="sw_behind">Only when I’m behind on water</string>
+              <string name="sw_meals">Remind me to log meals (about 9:30 am, 2 pm, 9 pm, only if not logged)</string>
+              <string name="sw_protein">Evening protein check (about 7:30 pm, if below 70% of goal)</string>
+              <string name="every">Every</string>
+              <string name="from">Active from</string>
+              <string name="to">to</string>
+              <string name="test_notif">Send a test notification</string>
+              <string name="notif_blocked">Notifications are turned off for Thali. Turn them on in Settings, then Apps, then Thali, then Notifications.</string>
+              <string name="notif_sent">Test notification sent. Reminders are set.</string>
           </resources>
           THALI_EOF
 
