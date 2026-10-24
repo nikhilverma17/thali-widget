@@ -77,7 +77,6 @@ jobs:
               <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-feature android:name="android.hardware.sensor.stepcounter" android:required="false" />
-              <uses-permission android:name="android.permission.health.READ_STEPS" />
               <uses-permission android:name="android.permission.health.READ_DISTANCE" />
               <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED" />
               <uses-permission android:name="android.permission.health.READ_SLEEP" />
@@ -668,7 +667,6 @@ jobs:
           import androidx.health.connect.client.records.DistanceRecord
           import androidx.health.connect.client.records.ExerciseSessionRecord
           import androidx.health.connect.client.records.SleepSessionRecord
-          import androidx.health.connect.client.records.StepsRecord
           import androidx.health.connect.client.request.AggregateRequest
           import androidx.health.connect.client.request.ReadRecordsRequest
           import androidx.health.connect.client.time.TimeRangeFilter
@@ -678,17 +676,17 @@ jobs:
           import java.time.ZoneId
           import java.util.concurrent.atomic.AtomicReference
 
-          /** Reads steps, distance, active calories, sleep and workouts from Health Connect (read only). Steps also come from the phone's own sensor (Steps.kt). */
+          /** Reads distance, active calories, sleep and workouts from Health Connect, e.g. from Google Fit (read only). Steps are not read here: the phone's own sensor counts them (Steps.kt). */
           object Health {
               const val PROVIDER = "com.google.android.apps.healthdata"
               private const val PREFS = "nutrilog_health"
 
-              private val STEPS = HealthPermission.getReadPermission(StepsRecord::class)
               private val DISTANCE = HealthPermission.getReadPermission(DistanceRecord::class)
               private val ACTIVE = HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class)
               private val SLEEP = HealthPermission.getReadPermission(SleepSessionRecord::class)
               private val EXERCISE = HealthPermission.getReadPermission(ExerciseSessionRecord::class)
-              val PERMISSIONS = setOf(STEPS, DISTANCE, ACTIVE, SLEEP, EXERCISE)
+              /** Steps are NOT read from Health Connect: they come only from the phone's own sensor (Steps.kt). */
+              val PERMISSIONS = setOf(DISTANCE, ACTIVE, SLEEP, EXERCISE)
 
               /** idle / syncing / done:<time> / error: <message>, read by the web app while it waits */
               val syncState = AtomicReference("idle")
@@ -743,8 +741,8 @@ jobs:
                   if (!prefs(ctx).getBoolean(yKey, false)) days.add(today.minusDays(1))
                   for (d in days) {
                       val hc = readDay(client, granted, d, zone)
-                      // use whichever is higher: the phone's own count or Health Connect (a watch may have counted more)
-                      val steps = maxOf(hc.steps, Steps.forDate(ctx, d.toString()))
+                      // steps come only from the phone's own sensor; distance, calories, sleep and workouts from Health Connect (Google Fit)
+                      val steps = Steps.forDate(ctx, d.toString())
                       val day = hc.copy(
                           steps = steps,
                           distanceM = if (hc.distanceM > 0) hc.distanceM else Steps.distanceM(steps),
@@ -762,10 +760,7 @@ jobs:
                   val end = if (Instant.now().isBefore(dayEnd)) Instant.now() else dayEnd
                   val range = TimeRangeFilter.between(start, end)
 
-                  var steps = 0L; var dist = 0L; var kcal = 0L
-                  if (STEPS in granted) runCatching {
-                      steps = client.aggregate(AggregateRequest(setOf(StepsRecord.COUNT_TOTAL), range))[StepsRecord.COUNT_TOTAL] ?: 0L
-                  }
+                  val steps = 0L; var dist = 0L; var kcal = 0L
                   if (DISTANCE in granted) runCatching {
                       dist = client.aggregate(AggregateRequest(setOf(DistanceRecord.DISTANCE_TOTAL), range))[DistanceRecord.DISTANCE_TOTAL]?.inMeters?.toLong() ?: 0L
                   }
@@ -1213,8 +1208,8 @@ jobs:
                   val server = if (sameDay) d?.optJSONObject("activity") else null
                   d?.optInt("stepGoal", 0)?.let { if (it > 0) Steps.setGoal(ctx, it) }
                   val goal = Steps.goal(ctx).coerceAtLeast(1)
-                  // what the phone counted, or more if your watch / Health Connect reported more
-                  val steps = max(Steps.forDate(ctx, todayKey), server?.optLong("steps", 0L) ?: 0L)
+                  // what the phone counted
+                  val steps = if (status == "active") Steps.forDate(ctx, todayKey) else server?.optLong("steps", 0L) ?: 0L
                   val frac = steps.toFloat() / goal
                   val done = steps >= goal
                   val showBars = hDp >= 170
@@ -1257,7 +1252,7 @@ jobs:
                       }
                       val today = java.time.LocalDate.now()
                       val days = (6 downTo 0).map { today.minusDays(it.toLong()) }
-                      val values = days.map { max(Steps.forDate(ctx, it.toString()), fromServer[it.toString()] ?: 0L).toInt() }
+                      val values = days.map { max(Steps.forDate(ctx, it.toString()), if (status == "active") 0L else fromServer[it.toString()] ?: 0L).toInt() }
                       val labels = days.map { it.dayOfWeek.getDisplayName(java.time.format.TextStyle.NARROW, Locale.getDefault()) }
                       val chartW = (wDp - 30).coerceIn(150, 360)
                       v.setImageViewBitmap(R.id.bars, Charts.bars(ctx, chartW, 56, values, labels, goal,
@@ -4856,7 +4851,7 @@ jobs:
               <string name="widget_week_desc">Seven-day calorie chart with your logging streak</string>
               <string name="widget_next_desc">What to eat next, with Log it and Another</string>
               <string name="health_privacy_title">How NutriLog uses your health data</string>
-              <string name="health_privacy_body">NutriLog counts your steps with your phone’s built-in step sensor, so no other app is needed. It only reads the step total, never your location.\n\nNutriLog also reads your steps, distance, active calories burned, sleep and workouts from Health Connect. It never changes or deletes anything there.\n\nThe daily totals are shown on your NutriLog Today screen, in your reports and on your widgets. They are saved with your NutriLog account in the Google Sheet that runs the app, so the owner of that sheet can see them.\n\nYou can turn this off at any time in Health Connect, under App permissions, then NutriLog.</string>
+              <string name="health_privacy_body">NutriLog counts your steps with your phone’s built-in step sensor, so no other app is needed. It only reads the step total, never your location.\n\nNutriLog also reads your distance, active calories burned, sleep and workouts from Health Connect. It never changes or deletes anything there.\n\nThe daily totals are shown on your NutriLog Today screen, in your reports and on your widgets. They are saved with your NutriLog account in the Google Sheet that runs the app, so the owner of that sheet can see them.\n\nYou can turn this off at any time in Health Connect, under App permissions, then NutriLog.</string>
               <string name="health_privacy_ok">Got it</string>
           </resources>
           THALI_EOF
